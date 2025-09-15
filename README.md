@@ -68,10 +68,8 @@ Open the LAN address in a browser on another device (connected to the same netwo
 ## Project Structure
 ```
 fileshare/
-│── share.py          # Flask application
+│── shareupgraded.py  # Flask application
 │── requirements.txt  # Python dependencies
-│── Procfile          # Optional, for deployment platforms
-│── .gitignore        # Ignored files and directories
 │── README.md         # Documentation
 │── shared/           # Uploaded files (per-user sessions, auto-cleaned)
 ```
