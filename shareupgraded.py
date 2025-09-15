@@ -1,12 +1,18 @@
-from flask import Flask, request, send_from_directory, render_template_string, redirect, url_for, send_file
-import os, zipfile, io
+from flask import Flask, request, send_from_directory, render_template_string, redirect, url_for, send_file, session
+import os, zipfile, io, uuid, threading, time, shutil
 
 app = Flask(__name__)
-UPLOAD_FOLDER = os.path.abspath("shared")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.secret_key = "supersecretkey"  # needed for session cookies
+BASE_FOLDER = os.path.abspath("shared")
+os.makedirs(BASE_FOLDER, exist_ok=True)
 
-# store passwords for files { filename: password or None }
+# store passwords for files { session_id: { filename: password or None } }
 file_passwords = {}
+
+# track last activity for cleanup
+last_active = {}
+SESSION_TIMEOUT = 600  # 10 minutes
+
 
 def get_icon(filename):
     ext = filename.split(".")[-1].lower()
@@ -22,6 +28,34 @@ def get_icon(filename):
         "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "gif": "🖼️"
     }
     return icons.get(ext, "📁")
+
+
+def get_session_id():
+    if "id" not in session:
+        session["id"] = str(uuid.uuid4())
+    return session["id"]
+
+
+def user_folder():
+    sid = get_session_id()
+    path = os.path.join(BASE_FOLDER, sid)
+    os.makedirs(path, exist_ok=True)
+    last_active[sid] = time.time()
+    return path
+
+
+def cleanup_sessions():
+    while True:
+        now = time.time()
+        for sid, ts in list(last_active.items()):
+            if now - ts > SESSION_TIMEOUT:
+                shutil.rmtree(os.path.join(BASE_FOLDER, sid), ignore_errors=True)
+                file_passwords.pop(sid, None)
+                del last_active[sid]
+        time.sleep(60)
+
+
+threading.Thread(target=cleanup_sessions, daemon=True).start()
 
 HTML = """
 <!DOCTYPE html>
@@ -49,7 +83,7 @@ HTML = """
         <div class="card p-4">
             <h2 class="text-center mb-4">📂 File Share</h2>
             
-            <!-- Single Upload Form -->
+            <!-- Upload Form -->
             <form id="upload-form" method="post" enctype="multipart/form-data" class="mb-3">
                 <div class="mb-2">
                     <input id="file-input" class="form-control" type="file" name="files" multiple required accept="*/*">
@@ -88,23 +122,29 @@ HTML = """
 </html>
 """
 
+
 @app.route("/", methods=["GET", "POST"])
 def home():
+    sid = get_session_id()
+    folder = user_folder()
     if request.method == "POST":
         uploaded_files = request.files.getlist("files")
         password = request.form.get("password") or None
         for uploaded_file in uploaded_files:
             if uploaded_file:
-                path = os.path.join(UPLOAD_FOLDER, uploaded_file.filename)
+                path = os.path.join(folder, uploaded_file.filename)
                 uploaded_file.save(path)
-                file_passwords[uploaded_file.filename] = password
-    files = [(f, get_icon(f)) for f in os.listdir(UPLOAD_FOLDER)]
-    protected = [f for f, p in file_passwords.items() if p]
+                file_passwords.setdefault(sid, {})[uploaded_file.filename] = password
+    files = [(f, get_icon(f)) for f in os.listdir(folder)]
+    protected = [f for f, p in file_passwords.get(sid, {}).items() if p]
     return render_template_string(HTML, files=files, protected=protected)
+
 
 @app.route("/download/<filename>", methods=["GET", "POST"])
 def download(filename):
-    password = file_passwords.get(filename)
+    sid = get_session_id()
+    folder = user_folder()
+    password = file_passwords.get(sid, {}).get(filename)
     if password:  # file has a password
         if request.method == "GET":
             return f"""
@@ -116,18 +156,21 @@ def download(filename):
             """
         elif request.method == "POST":
             if request.form.get("password") == password:
-                return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
+                return send_from_directory(folder, filename, as_attachment=True)
             else:
                 return "❌ Wrong password!"
     else:
-        return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
+        return send_from_directory(folder, filename, as_attachment=True)
+
 
 @app.route("/preview/<filename>")
 def preview_file(filename):
-    return send_from_directory(UPLOAD_FOLDER, filename)
+    return send_from_directory(user_folder(), filename)
+
 
 @app.route("/download-zip", methods=["POST"])
 def download_zip():
+    folder = user_folder()
     selected_files = request.form.getlist("selected_files")
     if not selected_files:
         return redirect(url_for("home"))
@@ -135,20 +178,24 @@ def download_zip():
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zipf:
         for file in selected_files:
-            filepath = os.path.join(UPLOAD_FOLDER, file)
+            filepath = os.path.join(folder, file)
             if os.path.exists(filepath):
                 zipf.write(filepath, arcname=file)
     zip_buffer.seek(0)
     return send_file(zip_buffer, mimetype="application/zip",
                      as_attachment=True, download_name="files.zip")
 
+
 @app.route("/delete/<filename>")
 def delete_file(filename):
-    path = os.path.join(UPLOAD_FOLDER, filename)
+    folder = user_folder()
+    path = os.path.join(folder, filename)
     if os.path.exists(path):
         os.remove(path)
-        file_passwords.pop(filename, None)
+        sid = get_session_id()
+        file_passwords.get(sid, {}).pop(filename, None)
     return redirect(url_for("home"))
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
